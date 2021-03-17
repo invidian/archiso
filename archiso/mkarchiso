@@ -134,8 +134,6 @@ _show_config() {
 _cleanup_airootfs() {
     _msg_info "Cleaning up what we can on airootfs..."
 
-    # Delete all files in /boot
-    [[ -d "${airootfs_dir}/boot" ]] && find "${airootfs_dir}/boot" -mindepth 1 -delete
     # Delete pacman database sync cache files (*.tar.gz)
     [[ -d "${airootfs_dir}/var/lib/pacman" ]] && find "${airootfs_dir}/var/lib/pacman" -maxdepth 1 -type f -delete
     # Delete pacman database sync cache
@@ -365,7 +363,7 @@ _make_customize_airootfs() {
 _make_bootmodes() {
     local bootmode
     for bootmode in "${bootmodes[@]}"; do
-        _run_once "_make_bootmode_${bootmode}"
+        "_make_bootmode_${bootmode}"
     done
 }
 
@@ -549,7 +547,57 @@ _make_bootmode_uefi-x64.efistub.secureboot.esp() {
     local -r release="${airootfs_dir}/etc/os-release"
     local -r initrd="${airootfs_dir}/boot/initramfs-linux.img"
     local -r output="${work_dir}/linux.efi"
-    local -r cmdline="archisolabel=${iso_label} archisobasedir=${install_dir}"
+    local -r iso_file="${out_dir}/${img_name}"
+    local -r second_run_marker="${work_dir}/second"
+    local -r last_run_marker="${work_dir}/last"
+
+    local cmdline="archisolabel=${iso_label} archisobasedir=${install_dir}"
+
+    if [[ -f "${iso_file}" ]]; then
+        if [[ -e "${second_run_marker}" ]]; then
+            touch "${last_run_marker}"
+        fi
+
+        touch "${second_run_marker}"
+
+        local -r skip=$(fdisk -l "${iso_file}" | grep "${img_name}1" | awk '{print $2}')
+        local -r count=$(fdisk -l "${iso_file}" | grep "${img_name}1" | awk '{print $4}')
+        local -r data_partition_file="${work_dir}/${img_name}1"
+
+        [[ -e "${data_partition_file}" ]] && rm -f -- "${data_partition_file}"
+
+        dd if=${iso_file} of=${data_partition_file} skip=${skip} count=${count}
+
+        local -r verity_log="${work_dir}/verity.log"
+        local -r verity_hash_file="${work_dir}/verity.hashdev"
+
+        # This is block size used by ISO9660. Bigger block size cannot be mounted.
+        local -r block_size=2048
+        local -r data_block_size=${block_size}
+        local -r hash_block_size=${block_size}
+
+        [[ -e "${verity_hash_file}" ]] && rm -f -- "${verity_hash_file}"
+        [[ -e "${verity_log}" ]] && rm -f -- "${verity_log}"
+
+        veritysetup format --data-block-size=${data_block_size} --hash-block-size=${hash_block_size} --debug "${data_partition_file}" "${verity_hash_file}" | tee "${verity_log}"
+
+        local -r verity_hash="$(awk '/Root hash:/ { print $3 }' "${verity_log}")"
+
+        local -r base_partition_uuid=$(blkid -o export "${iso_file}" | grep PTUUID | cut -d= -f2)
+        local -r incremented_segment=$(echo "${base_partition_uuid}" | cut -d- -f4 | sed 's/0$/3/g')
+        local -r target_uuid_prefix=$(echo "${base_partition_uuid}" | cut -d- -f1-3)
+        local -r target_uuid_suffix=$(echo "${base_partition_uuid}" | cut -d- -f5)
+        local -r target_uuid="${target_uuid_prefix}-${incremented_segment}-${target_uuid_suffix}"
+
+        # This name is also used in my custom dm_verity mkinitcpio hook to automatically add dm-verity device.
+        local -r verified_device_label="verified"
+
+        cmdline="archisolabel=${iso_label} archisobasedir=${install_dir} archisodevice=/dev/mapper/${verified_device_label} verity.datadev=/dev/disk/by-partlabel/ISO9660 verity.hashdev=/dev/disk/by-partuuid/${target_uuid} verity.hash=${verity_hash}"
+
+        rm "${iso_file}"
+    fi
+
+    [[ -e "${output}" ]] && rm -f -- "${output}"
 
     objcopy \
         --add-section .osrel="${release}"                   --change-section-vma .osrel=0x20000    \
@@ -560,9 +608,11 @@ _make_bootmode_uefi-x64.efistub.secureboot.esp() {
         "${efistub}" "${output}"
     wait $!
 
-    until sbsign --engine pkcs11 --key 'pkcs11:manufacturer=piv_II;id=%02' --cert "${profile}/db.pem" --output "${output}" "${output}"; do
-        _msg_info "Signing failed, try again..."
-    done
+    if [[ -e "${last_run_marker}" ]]; then
+        until sbsign --engine pkcs11 --key 'pkcs11:manufacturer=piv_II;id=%02' --cert "${profile}/db.pem" --output "${output}" "${output}"; do
+            _msg_info "Signing failed, try again..."
+        done
+    fi
 
     # the required image size in KiB (rounded up to the next full MiB with an additional MiB for reserved sectors)
     efiboot_imgsize="$(du -bc \
@@ -773,6 +823,15 @@ _add_xorrisofs_options_uefi-x64.systemd-boot.esp() {
 
 _add_xorrisofs_options_uefi-x64.efistub.secureboot.esp() {
     _add_xorrisofs_options_uefi-x64.systemd-boot.esp
+
+    local verity_hash_file="${work_dir}/verity.hashdev"
+
+    if [[ -f "${verity_hash_file}" ]]; then
+        xorrisofs_options+=(
+            '-append_partition' '3' '2c7357ed-ebd2-46d9-aec1-23d437ec2bf5' "${verity_hash_file}"
+            '-appended_part_as_gpt'
+        )
+    fi
 }
 
 # systemd-boot via El Torito
@@ -1017,10 +1076,31 @@ _build_profile() {
     _run_once _make_version
     _run_once _make_customize_airootfs
     _run_once _make_pkglist
-    _make_bootmodes
     _run_once _cleanup_airootfs
     _run_once _prepare_airootfs_image
-    _run_once _build_iso
+
+    # Build initial EFI partition image without dm-verity image.
+    _make_bootmodes
+
+    # Build ISO with EFI partition, so we can extract data partition
+    # and create initial dm-verity image.
+    _build_iso
+
+    # Extract data partition from ISO, build dm-verity partiton image for it
+    # and rebuild EFI partition image.
+    _make_bootmodes
+
+    # Rebuild ISO with dm-verity partition, which modifies the data
+    # partitionf or some reason.
+    _build_iso
+
+    # Extract data partition again, rebuild dm-verity partition image and rebuild
+    # EFI partition image. 3rd time lucky and at this step we sign the EFI application
+    # file with Secure Boot key.
+    _make_bootmodes
+
+    # Create final ISO image.
+    _build_iso
 }
 
 while getopts 'p:C:L:P:A:D:w:o:g:vh?' arg; do
